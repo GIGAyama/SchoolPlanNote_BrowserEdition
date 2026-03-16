@@ -70,7 +70,7 @@ const DEFAULT_SETTINGS = {
   classNumber: 1,
   teacherName: 'GIGA山 太郎',
   geminiApiKey: '',
-  geminiModelName: 'gemini-1.5-flash',
+  geminiModelName: 'gemini-2.5-flash',
   timetableRows: [
     { key: 'event', label: '行事', type: 'text' },
     { key: 'morning', label: '朝学習', type: 'text' },
@@ -504,7 +504,7 @@ function PlanView() {
         try {
           const base64Data = (reader.result as string).split(',')[1];
           const ai = new GoogleGenAI({ apiKey: data.settings.geminiApiKey });
-          const modelName = data.settings.geminiModelName || 'gemini-1.5-flash';
+          const modelName = data.settings.geminiModelName || 'gemini-2.5-flash';
 
           const prompt = `あなたは有能な教務主任・業務アシスタントAIです。
 提供されたPDFファイルは、学校の月間行事予定表です。
@@ -661,6 +661,18 @@ function PlanView() {
   const displayDaysCount = (!isEdit && !hasWeekendData) ? 5 : 7;
   const displayDays = editData.slice(0, displayDaysCount);
 
+  const uniqueSubjects = Array.from(new Set((data.unitMaster || []).map((u: any) => u.subject)));
+  const subjectsWithUnits = (data.unitMaster || []).reduce((acc: any, u: any) => {
+    if (!acc[u.subject]) acc[u.subject] = new Set();
+    if (u.unitName) acc[u.subject].add(u.unitName);
+    return acc;
+  }, {});
+  const unitsWithActivities = (data.unitMaster || []).reduce((acc: any, u: any) => {
+    if (!acc[u.unitName]) acc[u.unitName] = new Set();
+    if (u.activity) acc[u.unitName].add(u.activity);
+    return acc;
+  }, {});
+
   const dEnd = new Date(mondayDate); dEnd.setDate(dEnd.getDate() + 6);
   const endStr = formatDate(dEnd).replace(/\//g, '-');
   const startStr = mondayStr.replace(/\//g, '-');
@@ -790,16 +802,38 @@ function PlanView() {
     if(!isEdit) setIsEdit(true);
     pushState(JSON.parse(JSON.stringify(editData)));
     let newDays = JSON.parse(JSON.stringify(editData));
-    const umBySubject = {};
-    data.unitMaster.forEach(u => {
+    const umBySubject: Record<string, any[]> = {};
+    data.unitMaster.forEach((u: any) => {
       if(!umBySubject[u.subject]) umBySubject[u.subject] = [];
       umBySubject[u.subject].push(u);
     });
 
-    const track = {};
+    const track: Record<string, number> = {};
     let filledCount = 0;
 
-    newDays.forEach(day => {
+    // Calculate previous hours for each subject
+    Object.values(data.weeklyPlans).forEach((week: any) => {
+      week.forEach((day: any) => {
+        if (!day.date) return;
+        const [y, m, d] = day.date.split('/').map(Number);
+        const dayDate = new Date(y, m - 1, d);
+        if (dayDate < mondayDate) {
+          if(day.periods) {
+            Object.values(day.periods).forEach((p: any) => {
+              if(p && p.subject && p.content) { // Only count if content is filled, meaning it was actually taught
+                const parsed = extractHours(p.subject);
+                parsed.forEach(({ subject, hours }: any) => {
+                  if (!track[subject]) track[subject] = 0;
+                  track[subject] += hours;
+                });
+              }
+            });
+          }
+        }
+      });
+    });
+
+    newDays.forEach((day: any) => {
       if(!day.periods) return;
       Object.keys(day.periods).forEach(k => {
         const p = day.periods[k];
@@ -807,10 +841,13 @@ function PlanView() {
           const sName = p.subject.replace(/[\d/.\s　]/g, ''); 
           if(!track[sName]) track[sName] = 0;
           const list = umBySubject[sName];
-          if(list && list.length > track[sName]) {
-            p.unit = list[track[sName]].unitName;
-            p.content = list[track[sName]].activity;
-            track[sName]++;
+          const idx = Math.floor(track[sName]);
+          if(list && list.length > idx) {
+            p.unit = list[idx].unitName;
+            p.content = list[idx].activity;
+            const parsed = extractHours(p.subject);
+            const thisHours = parsed.find((x: any) => x.subject === sName)?.hours || 1;
+            track[sName] += thisHours;
             filledCount++;
           }
         }
@@ -839,6 +876,32 @@ function PlanView() {
       });
       setEditData(newDays);
       showToast('固定時間割を反映しました', 'success');
+    }
+  };
+
+  const copyFromPreviousWeek = () => {
+    const prevMonday = new Date(mondayDate);
+    prevMonday.setDate(prevMonday.getDate() - 7);
+    const prevMondayStr = formatDate(prevMonday);
+    const prevWeekData = data.weeklyPlans[prevMondayStr];
+
+    if (!prevWeekData) {
+      showToast('前週のデータがありません', 'error');
+      return;
+    }
+
+    if (window.confirm('現在の週に前週の予定を上書きしますか？')) {
+      if (!isEdit) setIsEdit(true);
+      pushState(JSON.parse(JSON.stringify(editData)));
+      const newDays = JSON.parse(JSON.stringify(editData));
+      prevWeekData.forEach((prevDay: any, i: number) => {
+        if (newDays[i]) {
+          newDays[i].periods = JSON.parse(JSON.stringify(prevDay.periods || {}));
+          if (prevDay.morning !== undefined) newDays[i].morning = prevDay.morning;
+        }
+      });
+      setEditData(newDays);
+      showToast('前週の予定を反映しました', 'success');
     }
   };
 
@@ -1027,6 +1090,7 @@ function PlanView() {
                 <button onClick={()=>setEditData(future[0])} disabled={future.length===0} className="p-2 rounded hover:bg-slate-200 disabled:opacity-30 text-slate-600"><Redo className="w-4 h-4"/></button>
               </div>
               <button onClick={applyBaseTimetable} className="px-3 py-1.5 rounded-xl bg-white border border-slate-200 text-slate-600 font-bold text-xs hover:bg-amber-50 hover:text-amber-600 transition-all flex items-center gap-1 shadow-sm"><CalendarClock className="w-4 h-4" /> 固定時間割</button>
+              <button onClick={copyFromPreviousWeek} className="px-3 py-1.5 rounded-xl bg-white border border-slate-200 text-slate-600 font-bold text-xs hover:bg-emerald-50 hover:text-emerald-600 transition-all flex items-center gap-1 shadow-sm"><Copy className="w-4 h-4" /> 前週からコピー</button>
               <button onClick={handleAutoFill} className="px-3 py-1.5 rounded-xl bg-white border border-slate-200 text-slate-600 font-bold text-xs hover:bg-indigo-50 hover:text-indigo-600 transition-all flex items-center gap-1 shadow-sm"><Wand2 className="w-4 h-4" /> AI単元入力</button>
               <button onClick={() => { setEditData(data.weeklyPlans[mondayStr]||generateInitialWeek()); setIsEdit(false); setPast([]); setFuture([]); }} className="px-4 py-2 rounded-xl bg-slate-200 text-slate-700 font-bold text-sm hover:bg-slate-300 transition-all ml-2">キャンセル</button>
               <button onClick={handleSave} className="px-5 py-2 rounded-xl bg-amber-500 text-white font-bold text-sm hover:bg-amber-600 transition-all flex items-center gap-2 shadow-sm"><Save className="w-4 h-4" /> 保存</button>
@@ -1094,8 +1158,8 @@ function PlanView() {
                             <div className="p-1 flex flex-col gap-1 h-full min-h-[68px]">
                               {isMulti ? (
                                 <>
-                                  <input placeholder="教科" className="w-full bg-slate-100 p-1 text-xs font-bold text-slate-800 rounded outline-none focus:bg-white focus:ring-1 focus:ring-amber-400" value={cellData.subject || ''} onChange={e => updateCell(cIdx, rowDef.key, 'subject', e.target.value)} onFocus={handleCellFocus} onBlur={handleCellBlur} />
-                                  <input placeholder="単元名" className="w-full bg-transparent p-1 text-[0.7rem] text-slate-500 rounded outline-none focus:bg-white focus:ring-1 focus:ring-amber-400" value={cellData.unit || ''} onChange={e => updateCell(cIdx, rowDef.key, 'unit', e.target.value)} onFocus={handleCellFocus} onBlur={handleCellBlur} />
+                                  <input list="subjects-list" placeholder="教科" className="w-full bg-slate-100 p-1 text-xs font-bold text-slate-800 rounded outline-none focus:bg-white focus:ring-1 focus:ring-amber-400" value={cellData.subject || ''} onChange={e => updateCell(cIdx, rowDef.key, 'subject', e.target.value)} onFocus={handleCellFocus} onBlur={handleCellBlur} />
+                                  <input list={cellData.subject ? `units-list-${cellData.subject}` : undefined} placeholder="単元名" className="w-full bg-transparent p-1 text-[0.7rem] text-slate-500 rounded outline-none focus:bg-white focus:ring-1 focus:ring-amber-400" value={cellData.unit || ''} onChange={e => updateCell(cIdx, rowDef.key, 'unit', e.target.value)} onFocus={handleCellFocus} onBlur={handleCellBlur} />
                                   <textarea placeholder="学習内容" className="w-full bg-transparent p-1 text-xs text-slate-600 rounded outline-none resize-none flex-1 focus:bg-white focus:ring-1 focus:ring-amber-400 min-h-[40px]" value={cellData.content || ''} onChange={e => updateCell(cIdx, rowDef.key, 'content', e.target.value)} onFocus={handleCellFocus} onBlur={handleCellBlur} />
                                 </>
                               ) : (
@@ -1267,6 +1331,20 @@ function PlanView() {
           </div>
         </div>
       )}
+      <datalist id="subjects-list">
+        {uniqueSubjects.map(s => <option key={s as string} value={s as string} />)}
+      </datalist>
+      {Object.entries(subjectsWithUnits).map(([sub, units]) => (
+        <datalist key={sub} id={`units-list-${sub}`}>
+          {Array.from(units as Set<string>).map(u => <option key={u} value={u} />)}
+        </datalist>
+      ))}
+      {Object.entries(unitsWithActivities).map(([unit, activities]) => (
+        <datalist key={unit} id={`activities-list-${unit}`}>
+          {Array.from(activities as Set<string>).map(a => <option key={a} value={a} />)}
+        </datalist>
+      ))}
+
       <GuideModal isOpen={showGuide} onClose={closeGuide} viewId="plan" />
     </div>
   );
@@ -1338,7 +1416,7 @@ function TaskView() {
 
   const callGeminiAPI = async (prompt: string, pdfBase64?: string) => {
     const apiKey = data.settings.geminiApiKey;
-    const modelName = data.settings.geminiModelName || 'gemini-1.5-flash';
+    const modelName = data.settings.geminiModelName || 'gemini-2.5-flash';
     if (!apiKey) throw new Error('Gemini APIキーが設定されていません。「設定」タブで登録してください。');
     
     const ai = new GoogleGenAI({ apiKey });
@@ -1599,9 +1677,64 @@ function UnitMasterView() {
   const [isGenerating, setIsGenerating] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const [draggedUnitId, setDraggedUnitId] = useState<string | null>(null);
+  const [dragOverUnitId, setDragOverUnitId] = useState<string | null>(null);
+
+  const handleDragStart = (id: string) => { setDraggedUnitId(id); };
+  const handleDragOver = (e: React.DragEvent, id: string) => {
+    e.preventDefault();
+    if (draggedUnitId && draggedUnitId !== id) {
+      setDragOverUnitId(id);
+    }
+  };
+  const handleDragLeave = () => { setDragOverUnitId(null); };
+  const handleDrop = (targetId: string) => {
+    setDragOverUnitId(null);
+    if (!draggedUnitId || draggedUnitId === targetId) return;
+    
+    updateData('unitMaster', (prev: any[]) => {
+      const newUnits = [...prev];
+      const draggedIndex = newUnits.findIndex(u => u.id === draggedUnitId);
+      const targetIndex = newUnits.findIndex(u => u.id === targetId);
+      if (draggedIndex === -1 || targetIndex === -1) return prev;
+      
+      const [draggedItem] = newUnits.splice(draggedIndex, 1);
+      
+      // Since we removed an item, the target index might have shifted
+      // If the dragged item was before the target item, the target index is now 1 less
+      const adjustedTargetIndex = draggedIndex < targetIndex ? targetIndex - 1 : targetIndex;
+      
+      newUnits.splice(adjustedTargetIndex, 0, draggedItem);
+      return newUnits;
+    });
+    setDraggedUnitId(null);
+  };
+
+  const handleAddBelow = (targetId: string) => {
+    const targetIndex = (data.unitMaster || []).findIndex((u: any) => u.id === targetId);
+    if (targetIndex === -1) return;
+    const targetUnit = data.unitMaster[targetIndex];
+    
+    const newUnit = { 
+      id: Date.now().toString(), 
+      subject: targetUnit.subject, 
+      unitName: targetUnit.unitName, 
+      totalHours: targetUnit.totalHours, 
+      hourNum: parseInt(targetUnit.hourNum) + 1 || 1, 
+      activity: '新しい活動内容' 
+    };
+    
+    updateData('unitMaster', (p: any) => {
+      const newArr = [...(p || [])];
+      newArr.splice(targetIndex + 1, 0, newUnit);
+      return newArr;
+    });
+    startEdit(newUnit);
+  };
+
   const handleAdd = () => {
     const newUnit = { id: Date.now().toString(), subject: '国語', unitName: '新しい単元', totalHours: 1, hourNum: 1, activity: '活動内容' };
-    updateData('unitMaster', (p: any) => [newUnit, ...p]);
+    updateData('unitMaster', (p: any) => [newUnit, ...(p || [])]);
     startEdit(newUnit);
   };
   const startEdit = (item: any) => { setEditingId(item.id); setEditForm(item); };
@@ -1628,7 +1761,7 @@ function UnitMasterView() {
           const base64Data = (event.target?.result as string).split(',')[1];
           const ai = new GoogleGenAI({ apiKey: data.settings.geminiApiKey });
           const response = await ai.models.generateContent({
-            model: data.settings.geminiModelName || 'gemini-1.5-flash',
+            model: data.settings.geminiModelName || 'gemini-2.5-flash',
             contents: [
               {
                 inlineData: {
@@ -1689,6 +1822,8 @@ function UnitMasterView() {
     const matchUnitName = filterUnitName === '' || u.unitName.includes(filterUnitName);
     return matchSubject && matchUnitName;
   });
+
+  const isFiltered = filterSubject !== '' || filterUnitName !== '';
 
   const uniqueSubjects = Array.from(new Set((data.unitMaster || []).map((u: any) => u.subject)));
 
@@ -1773,7 +1908,12 @@ function UnitMasterView() {
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.2 } }}
                       layout
-                      className={`hover:bg-slate-50 ${editingId === u.id ? 'bg-indigo-50/30' : ''}`}
+                      draggable={!isFiltered && editingId !== u.id}
+                      onDragStart={() => handleDragStart(u.id)}
+                      onDragOver={(e) => handleDragOver(e, u.id)}
+                      onDragLeave={handleDragLeave}
+                      onDrop={() => handleDrop(u.id)}
+                      className={`hover:bg-slate-50 ${editingId === u.id ? 'bg-indigo-50/30' : ''} ${dragOverUnitId === u.id ? 'border-t-2 border-indigo-500' : ''} ${!isFiltered && editingId !== u.id ? 'cursor-grab active:cursor-grabbing' : ''}`}
                     >
                       {editingId === u.id ? (
                         <>
@@ -1793,6 +1933,7 @@ function UnitMasterView() {
                           <td className="p-3 border-b text-slate-600">{u.activity}</td>
                           <td className="p-3 border-b text-center space-x-2">
                             <button onClick={()=>startEdit(u)} className="text-slate-400 hover:text-indigo-600"><Edit className="w-4 h-4 inline"/></button>
+                            <button onClick={()=>handleAddBelow(u.id)} className="text-slate-400 hover:text-emerald-600" title="この下に行を追加"><Plus className="w-4 h-4 inline"/></button>
                             <button onClick={()=>removeUnit(u.id)} className="text-slate-400 hover:text-red-600"><Trash2 className="w-4 h-4 inline"/></button>
                           </td>
                         </>
@@ -2168,19 +2309,17 @@ function NewsletterView() {
 
     showToast("AIが文章を作成しています...", "info");
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${data.settings.geminiModelName || 'gemini-1.5-flash'}:generateContent?key=${apiKey}`;
-      const payload = {
-        contents: [{ parts: [{ text: `あなたは小学校の先生です。保護者向けの学級通信に載せる文章を作成してください。\n内容: ${promptText}\n文字数: 150文字程度\nトーン: 温かく、前向きなトーン。HTMLタグは使わず、プレーンテキストで出力してください。` }] }],
-        generationConfig: { temperature: 0.7 }
-      };
-      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-      if (!res.ok) throw new Error('API通信エラー');
-      const json = await res.json();
-      const text = json.candidates[0].content.parts[0].text;
+      const ai = new GoogleGenAI({ apiKey });
+      const response = await ai.models.generateContent({
+        model: data.settings.geminiModelName || 'gemini-2.5-flash',
+        contents: `あなたは小学校の先生です。保護者向けの学級通信に載せる文章を作成してください。\n内容: ${promptText}\n文字数: 150文字程度\nトーン: 温かく、前向きなトーン。HTMLタグは使わず、プレーンテキストで出力してください。`,
+        config: { temperature: 0.7 }
+      });
       
+      const text = response.text || '';
       addBlock('text', insertIndex, text.replace(/\n/g, '<br>'));
       showToast('AIが文章を作成しました', 'success');
-    } catch (e) {
+    } catch (e: any) {
       showToast(e.message, 'error');
     }
   };
@@ -2719,6 +2858,14 @@ function SettingsView() {
 
   const [formData, setFormData] = useState(data.settings);
   const [syncCode, setSyncCode] = useState('');
+  const [isLoadingModels, setIsLoadingModels] = useState(false);
+  const [availableModels, setAvailableModels] = useState<{name: string, displayName: string}[]>(
+    data.settings.availableModels || [
+      { name: 'gemini-2.5-flash', displayName: 'gemini-2.5-flash (推奨・高速)' },
+      { name: 'gemini-3-flash-preview', displayName: 'gemini-3-flash-preview' },
+      { name: 'gemini-3.1-pro-preview', displayName: 'gemini-3.1-pro-preview (高精度)' },
+    ]
+  );
 
   useEffect(() => {
     const timeoutId = setTimeout(() => {
@@ -2745,6 +2892,35 @@ function SettingsView() {
       const template = Array(5).fill(null).map(() => ({ morning: '', periods: { period1:{subject:''}, period2:{subject:''}, period3:{subject:''}, period4:{subject:''}, period5:{subject:''}, period6:{subject:''} }}));
       setFormData({...formData, baseTimetable: template});
       showToast('空のテンプレートを作成しました。右下の「設定を保存」を押してください。', 'success');
+    }
+  };
+
+  const fetchModels = async () => {
+    if (!formData.geminiApiKey) {
+      showToast('APIキーを入力してください', 'error');
+      return;
+    }
+    setIsLoadingModels(true);
+    try {
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${formData.geminiApiKey}`);
+      if (!res.ok) throw new Error('Failed to fetch models');
+      const json = await res.json();
+      const models = json.models
+        .filter((m: any) => m.supportedGenerationMethods.includes('generateContent') && m.name.includes('gemini'))
+        .map((m: any) => ({
+          name: m.name.replace('models/', ''),
+          displayName: m.displayName || m.name.replace('models/', '')
+        }));
+      if (models.length > 0) {
+        setAvailableModels(models);
+        setFormData(prev => ({ ...prev, availableModels: models }));
+        showToast('モデル一覧を更新しました', 'success');
+      }
+    } catch (error) {
+      console.error(error);
+      showToast('モデル一覧の取得に失敗しました', 'error');
+    } finally {
+      setIsLoadingModels(false);
     }
   };
 
@@ -2874,14 +3050,28 @@ function SettingsView() {
               const newData = {...formData, geminiApiKey: e.target.value};
               setFormData(newData);
             }} placeholder="AIStudioで取得したキー..." className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 font-bold outline-none focus:ring-2 focus:ring-emerald-400" /></div>
-            <div><label className="block text-xs font-bold text-slate-500 mb-1">使用モデル</label>
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-xs font-bold text-slate-500">使用モデル</label>
+                <button 
+                  onClick={fetchModels} 
+                  disabled={!formData.geminiApiKey || isLoadingModels}
+                  className="text-[10px] bg-slate-200 hover:bg-slate-300 text-slate-600 px-2 py-0.5 rounded flex items-center gap-1 disabled:opacity-50 transition-colors"
+                >
+                  <RefreshCw className={`w-3 h-3 ${isLoadingModels ? 'animate-spin' : ''}`} />
+                  最新を取得
+                </button>
+              </div>
               <select value={formData.geminiModelName} onChange={e => {
                 const newData = {...formData, geminiModelName: e.target.value};
                 setFormData(newData);
               }} className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 font-bold outline-none focus:ring-2 focus:ring-emerald-400">
-                <option value="gemini-1.5-flash">gemini-1.5-flash (推奨・高速)</option>
-                <option value="gemini-1.5-pro">gemini-1.5-pro (高精度)</option>
-                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                {availableModels.map(m => (
+                  <option key={m.name} value={m.name}>{m.displayName}</option>
+                ))}
+                {!availableModels.find(m => m.name === formData.geminiModelName) && formData.geminiModelName && (
+                  <option value={formData.geminiModelName}>{formData.geminiModelName}</option>
+                )}
               </select>
             </div>
           </div>
